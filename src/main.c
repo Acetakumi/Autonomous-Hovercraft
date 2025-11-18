@@ -1,14 +1,21 @@
-#define F_CPU 16000000UL
 #include <util/delay.h>
-#include "fan.h"
-#include "adc.h"
+#include "fan/fan.h"
+#include "adc/adc.h"
+#include "uart/uart.h"
+
+int setup(void) {
+    UART_begin();
+    adc_init();
+    fans_init();
+
+    _delay_ms(500);
+
+    return 0;
+}
 
 int main(void)
 {
-    fans_init();
-    adc_init();
-
-    _delay_ms(500);
+    setup();
 
     while (1)
     {

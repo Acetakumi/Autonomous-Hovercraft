@@ -1,12 +1,12 @@
 #include <avr/io.h>
 #include "adc.h"
 
-// ----------------------------------------------------------
-// Initialize ADC:
-// - AREF = external reference (board provides it via Aref pin)
-// - Right-adjusted result
-// - ADC enabled, prescaler = 128 (125 kHz ADC clock)
-// ----------------------------------------------------------
+/**
+ * Initialize ADC:
+ * AREF = external reference (board provides it via Aref pin)
+ * Right-adjusted result
+ * ADC enabled, prescaler = 128 (125 kHz ADC clock)
+ */
 void adc_init(void)
 {
     // REFS1:0 = 00 → external AREF
@@ -15,8 +15,7 @@ void adc_init(void)
 
     // ADEN = 1 (enable ADC)
     // ADPS2:0 = 111 → prescaler 128
-    ADCSRA = (1 << ADEN) |
-             (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
+    ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
 }
 
 // ----------------------------------------------------------
@@ -35,8 +34,7 @@ uint16_t adc_read(uint8_t channel)
     ADCSRA |= (1 << ADSC);
 
     // Wait for conversion to complete
-    while (ADCSRA & (1 << ADSC))
-        ;
+    while (ADCSRA & (1 << ADSC));
 
     // Return 10-bit result
     return ADC;
