@@ -88,6 +88,7 @@
 #include "fan/fan.h"
 #include "adc/adc.h"
 #include "ir/ir.h"
+#include "imu/imu.h"
 
 void setup(void)
 {
@@ -98,6 +99,10 @@ void setup(void)
     fans_init();
     adc_init();
     ir_init();
+    imu_init();
+    UART_print("Calibrating gyro... keep hovercraft STILL\r\n");
+    imu_calibrate_gyro();
+    UART_print("Done calibration\r\n");
           // init ADC if you use battery_is_low()
 
     sei();               // enable global interrupts
@@ -124,6 +129,8 @@ int main(void)
         us_update_all(); 
 
         ir_update(); 
+
+        imu_update();  
        
         
         // updates us_front_cm, us_left_cm
@@ -145,7 +152,13 @@ int main(void)
          UART_print(" | IR raw: ");
         UART_printFloat((float)ir_front_raw);
 
-        UART_print(" cm\r\n");
+        UART_print(" | Yaw: ");
+        UART_printFloat(imu_yaw_deg);
+
+        UART_print(" | a_total: ");
+        UART_printFloat(imu_accel_total - 9.81f); // remove gravity  
+
+            UART_print(" cm\r\n");
 
         _delay_ms(200);
     }
