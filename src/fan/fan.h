@@ -12,4 +12,8 @@ void fan_lift_set(uint8_t duty);
 // Set thrust fan speed (0–255)
 void fan_thrust_set(uint8_t duty);
 
+void fans_update(void);
+
+void fans_shutdown(void);
+
 #endif
