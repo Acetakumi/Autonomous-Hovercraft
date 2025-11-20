@@ -15,28 +15,40 @@ void fans_init(void)
     // Set PD6 (OC0A) and PD5 (OC0B) as outputs
     DDRD |= (1 << DDD6) | (1 << DDD5);
 
-    // -------- Timer0 setup --------
-    // Fast PWM (8-bit) on both channels
-    // COM0A1:0 = 10 (non-inverting on OC0A)
-    // COM0B1:0 = 10 (non-inverting on OC0B)
-    // WGM01:0 = 11 (Fast PWM)
+    // Fast PWM on both channels, non-inverting
     TCCR0A = (1 << COM0A1) | (1 << COM0B1) |
              (1 << WGM01)  | (1 << WGM00);
 
-    // WGM02 = 0, Prescaler = 64
+    // Prescaler = 64
     TCCR0B = (1 << CS01) | (1 << CS00);
 
-    // Start fans off
-    OCR0A = 0;   // lift fan
-    OCR0B = 0;   // thrust fan
+    // Start fans OFF
+    OCR0A = 0;
+    OCR0B = 0;
 }
 
 void fan_lift_set(uint8_t duty)
 {
-    OCR0A = duty;   // PD6, OC0A
+    OCR0A = duty;   // OC0A → PD6
 }
 
 void fan_thrust_set(uint8_t duty)
 {
-    OCR0B = duty;   // PD5, OC0B
+    OCR0B = duty;   // OC0B → PD5
 }
+
+// NEW FUNCTION: cut both fans immediately
+void fans_shutdown(void)
+{
+    OCR0A = 0;
+    OCR0B = 0;
+}
+
+// Main fan logic (for now: turn both ON)
+void fans_update(void)
+{
+    // For now both fans ON at full power
+    fan_lift_set(255);
+    fan_thrust_set(255);
+}
+
