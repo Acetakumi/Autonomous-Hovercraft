@@ -20,19 +20,19 @@ extern uint16_t us_left_cm;
 #define FRONT_STOP_CM       30.0f   // at this distance: stop lift + thrust, then turn
 
 // Turning
-#define TURN_ANGLE_DEG      25.0f   // target yaw for turn
+#define TURN_ANGLE_DEG      48.0   // target yaw for turn
 #define YAW_TOL_DEG         2.0f    // how close to target to stop turn
 
 // Turn staging thresholds (fractions of TURN_ANGLE_DEG)
-#define TURN_ERR_FAR_DEG    (0.5f * TURN_ANGLE_DEG)   // > 10° = hard steering
-#define TURN_ERR_MED_DEG    (0.2f * TURN_ANGLE_DEG)   // > 4° = medium steering
+#define TURN_ERR_FAR_DEG    (0.5f * TURN_ANGLE_DEG)   // > 15° = hard steering
+#define TURN_ERR_MED_DEG    (0.2f * TURN_ANGLE_DEG)   // > 6°  = medium steering
 
 // Servo logical angles (-90..+90 range)
-#define SERVO_LEFT_LIMIT        -70.0f   // safe left limit
-#define SERVO_RIGHT_LIMIT       +60.0f   // safe right limit
+#define SERVO_LEFT_LIMIT        -40.0f   // safe left limit
+#define SERVO_RIGHT_LIMIT       +50.0f   // safe right limit
 #define SERVO_CENTER_ANGLE      10.0f    // <- THIS is your physical straight-ahead
 #define SERVO_RIGHT_MED_ANGLE   20.0f 
-#define SERVO_LEFT_MED_ANGLE   -20.0f   // medium angles to soften turns
+#define SERVO_LEFT_MED_ANGLE    -10.0f   // medium angles to soften turns
 
 // Heading-hold (for straight line)
 #define SERVO_TRIM_DEG      0.0f       // no extra trim; center is already 10°
@@ -43,23 +43,25 @@ extern uint16_t us_left_cm;
 
 // Fans
 #define LIFT_PWM                255
-#define THRUST_FORWARD_PWM      255
+#define TURN_LIFT_PWM           255
+#define THRUST_FORWARD_PWM      235
 
 // Turn speeds
-#define THRUST_TURN_PWM_FAST    200
-#define THRUST_TURN_PWM_SLOW    130
+#define THRUST_TURN_PWM_FAST    235
+#define THRUST_TURN_PWM_SLOW    200
 #define THRUST_STOP_PWM         0
 
 // Cooldown after turn
-#define POST_TURN_TICKS     12
+// *** Set to 0 so there is NO dead window without heading correction ***
+#define POST_TURN_TICKS     30
 
 // Safety / timing
-#define TURN_TIMEOUT_TICKS  30     
-#define TURN_MIN_TICKS      10      
+#define TURN_TIMEOUT_TICKS  20     
+#define TURN_MIN_TICKS      0    
 
 // US sanity
 #define US_MIN_VALID_CM     5
-#define US_MAX_VALID_CM     300
+#define US_MAX_VALID_CM     500
 
 // ---------- STATES ----------
 typedef enum {
@@ -126,7 +128,7 @@ static float ir_update_and_get_mean_cm(void)
 static void setup(void)
 {
     UART_begin();
-    UART_print("Hovercraft IR+IMU+US navigation (20deg turns, IR mean, staged angles, center=10deg)\r\n");
+    UART_print("Hovercraft IR+IMU+US navigation (30deg turns, IR mean, staged angles, center=10deg)\r\n");
 
     us_init();
     fans_init();
@@ -193,12 +195,19 @@ int main(void)
                 // Thrust & heading control
                 if (post_turn_ticks > 0)
                 {
-                    // Cooldown after turn: softer thrust, pure center
+                    // With POST_TURN_TICKS == 0, we basically never come here,
+                    // but keep it harmless if you change it later.
                     post_turn_ticks--;
                     fan_thrust_set(THRUST_TURN_PWM_FAST);
 
-                    float servo_cmd = SERVO_CENTER_ANGLE;  // pure center during cooldown
-                    servo_cmd = clampf(servo_cmd, SERVO_LEFT_LIMIT, SERVO_RIGHT_LIMIT);
+                    float err = normalize_angle_deg(heading_target_deg - yaw);
+                    if (fabsf(err) < 1.0f) err = 0.0f;
+
+                    float servo_cmd = clampf(
+                        SERVO_CENTER_ANGLE + SERVO_TRIM_DEG - 0.5f * KP_HEADING * err, 
+                        SERVO_LEFT_LIMIT, 
+                        SERVO_RIGHT_LIMIT
+                    );
                     servo_set_angle_deg(servo_cmd);
                 }
                 else
@@ -245,7 +254,7 @@ int main(void)
                         uint8_t left_ok  = us_valid(us_left_cm);
                         uint8_t right_ok = us_valid(us_right_cm);
 
-                        // Reset yaw so 0° = current forward
+                        // Reset yaw so 0° = current forward BEFORE the turn
                         imu_reset_yaw();
                         imu_update();
                         yaw = normalize_angle_deg(imu_yaw_deg);
@@ -282,7 +291,7 @@ int main(void)
                         }
 
                         // Before entering turn, restore lift (thrust is handled in TURN state)
-                        fan_lift_set(LIFT_PWM);
+                        fan_lift_set(TURN_LIFT_PWM);
                         fan_thrust_set(THRUST_STOP_PWM);
                     }
                 }
@@ -296,7 +305,7 @@ int main(void)
             case STATE_TURN_LEFT:
             {
                 // Lift ON during turn
-                fan_lift_set(LIFT_PWM);
+                fan_lift_set(TURN_LIFT_PWM);
 
                 turn_ticks++;
 
@@ -328,7 +337,7 @@ int main(void)
                     else if (abs_err > YAW_TOL_DEG)
                     {
                         // Very close but not done: gentle left (half-medium)
-                        servo_f = SERVO_LEFT_MED_ANGLE * 0.5f;   // ≈ -7.5°
+                        servo_f = SERVO_LEFT_MED_ANGLE * 0.5f;   // ≈ -5°
                     }
                     else
                     {
@@ -344,7 +353,7 @@ int main(void)
                     }
                     else if (abs_err > YAW_TOL_DEG)
                     {
-                        servo_f = SERVO_RIGHT_MED_ANGLE * 0.5f;  // ≈ +7.5°
+                        servo_f = SERVO_RIGHT_MED_ANGLE * 0.5f;  // ≈ +10°
                     }
                     else
                     {
@@ -364,14 +373,14 @@ int main(void)
                     fan_thrust_set(THRUST_STOP_PWM);
                     _delay_ms(200);
 
-                    imu_reset_yaw();
-                    imu_update();
-                    heading_target_deg = 0.0f;
+                    // *** DO NOT reset yaw here ***
+                    // Keep the current yaw as the new heading target
+                    heading_target_deg = yaw;
 
                     // After turn: pure center (10°)
                     servo_set_angle_deg(SERVO_CENTER_ANGLE);
 
-                    post_turn_ticks = POST_TURN_TICKS;
+                    post_turn_ticks = POST_TURN_TICKS;  // 0 -> immediate heading correction
                     state = STATE_FORWARD;
                 }
                 else if (turn_ticks > TURN_TIMEOUT_TICKS)
@@ -380,10 +389,8 @@ int main(void)
                     fan_thrust_set(THRUST_STOP_PWM);
                     _delay_ms(200);
 
-                    imu_reset_yaw();
-                    imu_update();
-                    heading_target_deg = 0.0f;
-
+                    // Even on timeout, hold whatever yaw we have
+                    heading_target_deg = yaw;
                     servo_set_angle_deg(SERVO_CENTER_ANGLE);
 
                     post_turn_ticks = POST_TURN_TICKS;
@@ -397,7 +404,7 @@ int main(void)
             // ============================
             case STATE_TURN_RIGHT:
             {
-                fan_lift_set(LIFT_PWM);
+                fan_lift_set(TURN_LIFT_PWM);
 
                 turn_ticks++;
 
@@ -428,7 +435,7 @@ int main(void)
                     else if (abs_err > YAW_TOL_DEG)
                     {
                         // Very close, gentle right
-                        servo_f = SERVO_RIGHT_MED_ANGLE * 0.5f; // ≈ +7.5°
+                        servo_f = SERVO_RIGHT_MED_ANGLE * 0.5f; // ≈ +10°
                     }
                     else
                     {
@@ -444,7 +451,7 @@ int main(void)
                     }
                     else if (abs_err > YAW_TOL_DEG)
                     {
-                        servo_f = SERVO_LEFT_MED_ANGLE * 0.5f; // ≈ -7.5°
+                        servo_f = SERVO_LEFT_MED_ANGLE * 0.5f; // ≈ -5°
                     }
                     else
                     {
@@ -464,9 +471,8 @@ int main(void)
                     fan_thrust_set(THRUST_STOP_PWM);
                     _delay_ms(200);
 
-                    imu_reset_yaw();
-                    imu_update();
-                    heading_target_deg = 0.0f;
+                    // *** DO NOT reset yaw here ***
+                    heading_target_deg = yaw;
 
                     servo_set_angle_deg(SERVO_CENTER_ANGLE);
 
@@ -479,9 +485,7 @@ int main(void)
                     fan_thrust_set(THRUST_STOP_PWM);
                     _delay_ms(200);
 
-                    imu_reset_yaw();
-                    imu_update();
-                    heading_target_deg = 0.0f;
+                    heading_target_deg = yaw;
 
                     servo_set_angle_deg(SERVO_CENTER_ANGLE);
 
