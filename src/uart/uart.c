@@ -41,18 +41,18 @@ void UART_print(const char *str)
 
 void UART_printFloat(float value)
 {
-    // Handle negative values
+  
     if (value < 0)
     {
         UART_write('-');
         value = -value;
     }
 
-    // Integer part
+    
     int intPart = (int)value;
     float frac = value - intPart;
 
-    // Print integer part
+   
     char buffer[10];
     int i = 0;
 
@@ -73,7 +73,6 @@ void UART_printFloat(float value)
 
     UART_write('.');
 
-    // Fraction: multiply by 100 to get 2 decimals
     int fracInt = (int)(frac * 100 + 0.5f);
 
     UART_write('0' + (fracInt / 10));

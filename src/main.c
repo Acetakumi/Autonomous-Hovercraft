@@ -10,514 +10,201 @@
 #include "servo/servo.h"
 #include "ir/ir.h"
 
-// ---------- EXTERNS FROM ultrasonic.c ----------
 extern uint16_t us_right_cm;
 extern uint16_t us_left_cm;
 
-// ---------- CONSTANTS ----------
+#define FRONT_STOP_CM 30.0f
+#define TURN_ANGLE_DEG 48.0f
+#define YAW_TOL_DEG 2.0f
 
-// IR-based obstacle distances (cm, using ir_get_cm())
-#define FRONT_STOP_CM       30.0f   // at this distance: stop lift + thrust, then turn
+#define SERVO_LEFT_LIMIT -40.0f
+#define SERVO_RIGHT_LIMIT 50.0f
+#define SERVO_CENTER_ANGLE 10.0f
+#define KP_HEADING 2.0f
 
-// Turning
-#define TURN_ANGLE_DEG      48.0   // target yaw for turn
-#define YAW_TOL_DEG         2.0f    // how close to target to stop turn
+#define LIFT_PWM 255
+#define THRUST_FORWARD_PWM 235
+#define THRUST_TURN_PWM 220
+#define THRUST_STOP_PWM 0
 
-// Turn staging thresholds (fractions of TURN_ANGLE_DEG)
-#define TURN_ERR_FAR_DEG    (0.5f * TURN_ANGLE_DEG)   // > 15° = hard steering
-#define TURN_ERR_MED_DEG    (0.2f * TURN_ANGLE_DEG)   // > 6°  = medium steering
+#define TURN_TIMEOUT_TICKS 200
 
-// Servo logical angles (-90..+90 range)
-#define SERVO_LEFT_LIMIT        -40.0f   // safe left limit
-#define SERVO_RIGHT_LIMIT       +50.0f   // safe right limit
-#define SERVO_CENTER_ANGLE      10.0f    // <- THIS is your physical straight-ahead
-#define SERVO_RIGHT_MED_ANGLE   20.0f 
-#define SERVO_LEFT_MED_ANGLE    -10.0f   // medium angles to soften turns
-
-// Heading-hold (for straight line)
-#define SERVO_TRIM_DEG      0.0f       // no extra trim; center is already 10°
-#define KP_HEADING          2.0f       // correction for drift
-
-// Turn steering gain (kept for possible future use)
-#define K_TURN_SERVO        2.5f
-
-// Fans
-#define LIFT_PWM                255
-#define TURN_LIFT_PWM           255
-#define THRUST_FORWARD_PWM      235
-
-// Turn speeds
-#define THRUST_TURN_PWM_FAST    235
-#define THRUST_TURN_PWM_SLOW    200
-#define THRUST_STOP_PWM         0
-
-// Cooldown after turn
-// *** Set to 0 so there is NO dead window without heading correction ***
-#define POST_TURN_TICKS     30
-
-// Safety / timing
-#define TURN_TIMEOUT_TICKS  20     
-#define TURN_MIN_TICKS      0    
-
-// US sanity
-#define US_MIN_VALID_CM     5
-#define US_MAX_VALID_CM     500
-
-// ---------- STATES ----------
 typedef enum {
     STATE_FORWARD = 0,
     STATE_TURN_LEFT,
     STATE_TURN_RIGHT
 } HoverState;
 
-// ---------- GLOBALS ----------
-static float   heading_target_deg = 0.0f;
-static float   turn_target_deg    = 0.0f;
-static uint8_t post_turn_ticks    = 0;
-static uint16_t turn_ticks        = 0;
+static float heading_target_deg = 0.0f;
+static float turn_target_deg = 0.0f;
+static uint16_t turn_ticks = 0;
 
-// ---------- IR SMOOTHING ----------
-#define IR_MEAN_WINDOW 5
-static float   ir_buf[IR_MEAN_WINDOW];
-static uint8_t ir_buf_idx   = 0;
-static uint8_t ir_buf_count = 0;
-
-// ---------- IR STARTUP IGNORE ----------
-#define IR_IGNORE_LOOPS    50      // ignore IR for first N main loops
-static uint16_t loop_count = 0;    // increments every loop
-
-// ---------- HELPERS ----------
-
-static float normalize_angle_deg(float a)
+static float normalize(float a)
 {
-    while (a > 180.0f)   a -= 360.0f;
+    while (a > 180.0f) a -= 360.0f;
     while (a <= -180.0f) a += 360.0f;
     return a;
 }
 
-static uint8_t us_valid(uint16_t cm)
+static float clamp(float x, float a, float b)
 {
-    return (cm >= US_MIN_VALID_CM && cm <= US_MAX_VALID_CM);
-}
-
-static float clampf(float x, float min, float max)
-{
-    if (x < min) return min;
-    if (x > max) return max;
+    if (x < a) return a;
+    if (x > b) return b;
     return x;
 }
 
-// Update IR, push into buffer, return mean cm
-static float ir_update_and_get_mean_cm(void)
+static uint8_t us_ok(uint16_t cm)
 {
-    ir_update();
-    float cm = (float) ir_get_cm();
-
-    ir_buf[ir_buf_idx] = cm;
-    ir_buf_idx = (ir_buf_idx + 1) % IR_MEAN_WINDOW;
-    if (ir_buf_count < IR_MEAN_WINDOW)
-        ir_buf_count++;
-
-    float sum = 0.0f;
-    for (uint8_t i = 0; i < ir_buf_count; i++)
-        sum += ir_buf[i];
-
-    return sum / (float)ir_buf_count;
+    return (cm >= 5 && cm <= 500);
 }
 
-static void setup(void)
+static void setup_all(void)
 {
     UART_begin();
-    UART_print("Hovercraft IR+IMU+US navigation (30deg turns, IR mean, staged angles, center=10deg)\r\n");
-
     us_init();
     fans_init();
     servo_init();
     ir_init();
     imu_init();
-
-    UART_print("Calibrating gyro...\r\n");
     imu_calibrate_gyro();
-    UART_print("Gyro OK\r\n");
-
     imu_update();
     imu_reset_yaw();
-
-    heading_target_deg = 0.0f;
-
-    // Center servo at *true* straight-ahead
     servo_set_angle_deg(SERVO_CENTER_ANGLE);
-
-    // Lift ON, thrust OFF at boot
     fan_lift_set(LIFT_PWM);
-    fan_thrust_set(THRUST_STOP_PWM);
-
+    fan_thrust_set(0);
     sei();
 }
 
-// ---------- MAIN ----------
 int main(void)
 {
-    setup();
-
+    setup_all();
     HoverState state = STATE_FORWARD;
 
     while (1)
     {
-        // increment loop counter EVERY loop
-        loop_count++;
-
         imu_update();
+        float yaw = normalize(imu_yaw_deg);
 
-        float yaw = normalize_angle_deg(imu_yaw_deg);
-
-        if (yaw > 720.0f || yaw < -720.0f)
-        {
-            UART_print("WARN: yaw out of crazy range, resetting\r\n");
-            imu_reset_yaw();
-            imu_update();
-            yaw = normalize_angle_deg(imu_yaw_deg);
-        }
-
-        // Get smoothed IR distance (we can read it, but we won't ACT on it until loop_count > IR_IGNORE_LOOPS)
-        float front_cm = ir_update_and_get_mean_cm();
+        ir_update();
+        float front_cm = ir_get_cm();
 
         switch (state)
         {
-            // ============================
-            //   FORWARD
-            // ============================
             case STATE_FORWARD:
             {
-                // Lift always ON in straight
                 fan_lift_set(LIFT_PWM);
+                fan_thrust_set(THRUST_FORWARD_PWM);
 
-                // Thrust & heading control
-                if (post_turn_ticks > 0)
+                float err = normalize(heading_target_deg - yaw);
+                float s = SERVO_CENTER_ANGLE - KP_HEADING * err;
+                s = clamp(s, SERVO_LEFT_LIMIT, SERVO_RIGHT_LIMIT);
+                servo_set_angle_deg(s);
+
+                if (front_cm <= FRONT_STOP_CM)
                 {
-                    // With POST_TURN_TICKS == 0, we basically never come here,
-                    // but keep it harmless if you change it later.
-                    post_turn_ticks--;
-                    fan_thrust_set(THRUST_TURN_PWM_FAST);
+                    fan_thrust_set(0);
+                    fan_lift_set(0);
+                    servo_set_angle_deg(SERVO_CENTER_ANGLE);
+                    _delay_ms(700);
 
-                    float err = normalize_angle_deg(heading_target_deg - yaw);
-                    if (fabsf(err) < 1.0f) err = 0.0f;
+                    us_update_all();
+                    imu_reset_yaw();
+                    imu_update();
+                    yaw = normalize(imu_yaw_deg);
 
-                    float servo_cmd = clampf(
-                        SERVO_CENTER_ANGLE + SERVO_TRIM_DEG - 0.5f * KP_HEADING * err, 
-                        SERVO_LEFT_LIMIT, 
-                        SERVO_RIGHT_LIMIT
-                    );
-                    servo_set_angle_deg(servo_cmd);
-                }
-                else
-                {
-                    fan_thrust_set(THRUST_FORWARD_PWM);
+                    uint8_t L = us_ok(us_left_cm);
+                    uint8_t R = us_ok(us_right_cm);
 
-                    float err = normalize_angle_deg(heading_target_deg - yaw);
-                    if (fabsf(err) < 1.0f) err = 0.0f;
-
-                    float servo_cmd = clampf(
-                        SERVO_CENTER_ANGLE + SERVO_TRIM_DEG - KP_HEADING * err, 
-                        SERVO_LEFT_LIMIT, 
-                        SERVO_RIGHT_LIMIT
-                    );
-                    
-                    servo_set_angle_deg(servo_cmd);
-                }
-
-                // ---------- HARD STOP + TURN DECISION (using MEAN IR) ----------
-                // We ONLY allow IR to trigger after IR_IGNORE_LOOPS main loops.
-                if (loop_count > IR_IGNORE_LOOPS)
-                {
-                    if (post_turn_ticks == 0 && front_cm <= FRONT_STOP_CM)
+                    if (L && !R)
                     {
-                        UART_print("OBSTACLE (MEAN IR): front_ir_cm = ");
-                        UART_printFloat(front_cm);
-                        UART_print(" -> HARD STOP (lift+thrust)\r\n");
-
-                        // FULL STOP: kill thrust + lift, keep servo straight
-                        fan_thrust_set(THRUST_STOP_PWM);
-                        fan_lift_set(0);
-                        servo_set_angle_deg(SERVO_CENTER_ANGLE);
-                        _delay_ms(1000);   // let it settle flat
-
-                        // Get left/right space with ultrasonics
-                        us_update_all();
-
-                        UART_print("US Right: ");
-                        UART_printFloat((float)us_right_cm);
-                        UART_print(" cm | US Left: ");
-                        UART_printFloat((float)us_left_cm);
-                        UART_print(" cm\r\n");
-
-                        uint8_t left_ok  = us_valid(us_left_cm);
-                        uint8_t right_ok = us_valid(us_right_cm);
-
-                        // Reset yaw so 0° = current forward BEFORE the turn
-                        imu_reset_yaw();
-                        imu_update();
-                        yaw = normalize_angle_deg(imu_yaw_deg);
-
-                        turn_ticks = 0;
-
-                        // Decide direction
-                        if (left_ok && !right_ok)
+                        turn_target_deg = TURN_ANGLE_DEG;
+                        state = STATE_TURN_LEFT;
+                    }
+                    else if (!L && R)
+                    {
+                        turn_target_deg = -TURN_ANGLE_DEG;
+                        state = STATE_TURN_RIGHT;
+                    }
+                    else
+                    {
+                        if (us_left_cm > us_right_cm)
                         {
-                            turn_target_deg = +TURN_ANGLE_DEG;
+                            turn_target_deg = TURN_ANGLE_DEG;
                             state = STATE_TURN_LEFT;
-                            UART_print("Decision: TURN LEFT (right invalid)\r\n");
-                        }
-                        else if (!left_ok && right_ok)
-                        {
-                            turn_target_deg = -TURN_ANGLE_DEG;
-                            state = STATE_TURN_RIGHT;
-                            UART_print("Decision: TURN RIGHT (left invalid)\r\n");
                         }
                         else
                         {
-                            if (us_left_cm > us_right_cm)
-                            {
-                                turn_target_deg = +TURN_ANGLE_DEG;
-                                state = STATE_TURN_LEFT;
-                                UART_print("Decision: TURN LEFT\r\n");
-                            }
-                            else
-                            {
-                                turn_target_deg = -TURN_ANGLE_DEG;
-                                state = STATE_TURN_RIGHT;
-                                UART_print("Decision: TURN RIGHT\r\n");
-                            }
+                            turn_target_deg = -TURN_ANGLE_DEG;
+                            state = STATE_TURN_RIGHT;
                         }
-
-                        // Before entering turn, restore lift (thrust is handled in TURN state)
-                        fan_lift_set(TURN_LIFT_PWM);
-                        fan_thrust_set(THRUST_STOP_PWM);
                     }
+
+                    turn_ticks = 0;
                 }
 
                 break;
             }
 
-            // ============================
-            //   TURN LEFT (aim +TURN_ANGLE_DEG)
-            // ============================
             case STATE_TURN_LEFT:
             {
-                // Lift ON during turn
-                fan_lift_set(TURN_LIFT_PWM);
-
                 turn_ticks++;
+                fan_lift_set(LIFT_PWM);
+                fan_thrust_set(THRUST_TURN_PWM);
 
-                float err = normalize_angle_deg(turn_target_deg - yaw);
-                float abs_err = fabsf(err);
+                float err = normalize(turn_target_deg - yaw);
+                float s = SERVO_LEFT_LIMIT;
+                if (fabs(err) < 20) s = SERVO_CENTER_ANGLE;
+                servo_set_angle_deg(s);
 
-                // Speed: faster when far, slower when close
-                uint8_t thrust_turn =
-                    (abs_err > TURN_ERR_FAR_DEG) ? THRUST_TURN_PWM_FAST : THRUST_TURN_PWM_SLOW;
-
-                fan_thrust_set(thrust_turn);
-
-                // ---- STAGED SERVO USING MED ANGLES ----
-                float servo_f;
-
-                if (err > 0.0f)
+                if (fabs(err) < YAW_TOL_DEG)
                 {
-                    // We still need to turn LEFT
-                    if (abs_err > TURN_ERR_FAR_DEG)
-                    {
-                        // Far from target: hard left
-                        servo_f = SERVO_LEFT_LIMIT;
-                    }
-                    else if (abs_err > TURN_ERR_MED_DEG)
-                    {
-                        // Closer: medium left
-                        servo_f = SERVO_LEFT_MED_ANGLE;
-                    }
-                    else if (abs_err > YAW_TOL_DEG)
-                    {
-                        // Very close but not done: gentle left (half-medium)
-                        servo_f = SERVO_LEFT_MED_ANGLE * 0.5f;   // ≈ -5°
-                    }
-                    else
-                    {
-                        servo_f = SERVO_CENTER_ANGLE;
-                    }
-                }
-                else
-                {
-                    // Overshoot (err <= 0), small correction to the right
-                    if (abs_err > TURN_ERR_MED_DEG)
-                    {
-                        servo_f = SERVO_RIGHT_MED_ANGLE;
-                    }
-                    else if (abs_err > YAW_TOL_DEG)
-                    {
-                        servo_f = SERVO_RIGHT_MED_ANGLE * 0.5f;  // ≈ +10°
-                    }
-                    else
-                    {
-                        servo_f = SERVO_CENTER_ANGLE;
-                    }
-                }
-
-                servo_f = clampf(servo_f, SERVO_LEFT_LIMIT, SERVO_RIGHT_LIMIT);
-                servo_set_angle_deg(servo_f);
-
-                if (turn_ticks > TURN_MIN_TICKS && abs_err < YAW_TOL_DEG)
-                {
-                    UART_print("LEFT TURN DONE, yaw=");
-                    UART_printFloat(yaw);
-                    UART_print("\r\n");
-
-                    fan_thrust_set(THRUST_STOP_PWM);
-                    _delay_ms(200);
-
-                    // *** DO NOT reset yaw here ***
-                    // Keep the current yaw as the new heading target
                     heading_target_deg = yaw;
-
-                    // After turn: pure center (10°)
+                    fan_thrust_set(0);
                     servo_set_angle_deg(SERVO_CENTER_ANGLE);
-
-                    post_turn_ticks = POST_TURN_TICKS;  // 0 -> immediate heading correction
                     state = STATE_FORWARD;
                 }
-                else if (turn_ticks > TURN_TIMEOUT_TICKS)
+
+                if (turn_ticks > TURN_TIMEOUT_TICKS)
                 {
-                    UART_print("WARN: LEFT turn timeout, forcing FORWARD\r\n");
-                    fan_thrust_set(THRUST_STOP_PWM);
-                    _delay_ms(200);
-
-                    // Even on timeout, hold whatever yaw we have
                     heading_target_deg = yaw;
-                    servo_set_angle_deg(SERVO_CENTER_ANGLE);
-
-                    post_turn_ticks = POST_TURN_TICKS;
+                    fan_thrust_set(0);
                     state = STATE_FORWARD;
                 }
+
                 break;
             }
 
-            // ============================
-            //   TURN RIGHT (aim -TURN_ANGLE_DEG)
-            // ============================
             case STATE_TURN_RIGHT:
             {
-                fan_lift_set(TURN_LIFT_PWM);
-
                 turn_ticks++;
+                fan_lift_set(LIFT_PWM);
+                fan_thrust_set(THRUST_TURN_PWM);
 
-                float err = normalize_angle_deg(turn_target_deg - yaw);
-                float abs_err = fabsf(err);
+                float err = normalize(turn_target_deg - yaw);
+                float s = SERVO_RIGHT_LIMIT;
+                if (fabs(err) < 20) s = SERVO_CENTER_ANGLE;
+                servo_set_angle_deg(s);
 
-                uint8_t thrust_turn =
-                    (abs_err > TURN_ERR_FAR_DEG) ? THRUST_TURN_PWM_FAST : THRUST_TURN_PWM_SLOW;
-
-                fan_thrust_set(thrust_turn);
-
-                // ---- STAGED SERVO USING MED ANGLES ----
-                float servo_f;
-
-                if (err < 0.0f)
+                if (fabs(err) < YAW_TOL_DEG)
                 {
-                    // Still need to turn RIGHT (target is negative)
-                    if (abs_err > TURN_ERR_FAR_DEG)
-                    {
-                        // Far from target: hard right
-                        servo_f = SERVO_RIGHT_LIMIT;
-                    }
-                    else if (abs_err > TURN_ERR_MED_DEG)
-                    {
-                        // Closer: medium right
-                        servo_f = SERVO_RIGHT_MED_ANGLE;
-                    }
-                    else if (abs_err > YAW_TOL_DEG)
-                    {
-                        // Very close, gentle right
-                        servo_f = SERVO_RIGHT_MED_ANGLE * 0.5f; // ≈ +10°
-                    }
-                    else
-                    {
-                        servo_f = SERVO_CENTER_ANGLE;
-                    }
-                }
-                else
-                {
-                    // Overshoot (err >= 0), small correction to the left
-                    if (abs_err > TURN_ERR_MED_DEG)
-                    {
-                        servo_f = SERVO_LEFT_MED_ANGLE;
-                    }
-                    else if (abs_err > YAW_TOL_DEG)
-                    {
-                        servo_f = SERVO_LEFT_MED_ANGLE * 0.5f; // ≈ -5°
-                    }
-                    else
-                    {
-                        servo_f = SERVO_CENTER_ANGLE;
-                    }
-                }
-
-                servo_f = clampf(servo_f, SERVO_LEFT_LIMIT, SERVO_RIGHT_LIMIT);
-                servo_set_angle_deg(servo_f);
-
-                if (turn_ticks > TURN_MIN_TICKS && abs_err < YAW_TOL_DEG)
-                {
-                    UART_print("RIGHT TURN DONE, yaw=");
-                    UART_printFloat(yaw);
-                    UART_print("\r\n");
-
-                    fan_thrust_set(THRUST_STOP_PWM);
-                    _delay_ms(200);
-
-                    // *** DO NOT reset yaw here ***
                     heading_target_deg = yaw;
-
+                    fan_thrust_set(0);
                     servo_set_angle_deg(SERVO_CENTER_ANGLE);
-
-                    post_turn_ticks = POST_TURN_TICKS;
                     state = STATE_FORWARD;
                 }
-                else if (turn_ticks > TURN_TIMEOUT_TICKS)
+
+                if (turn_ticks > TURN_TIMEOUT_TICKS)
                 {
-                    UART_print("WARN: RIGHT turn timeout, forcing FORWARD\r\n");
-                    fan_thrust_set(THRUST_STOP_PWM);
-                    _delay_ms(200);
-
                     heading_target_deg = yaw;
-
-                    servo_set_angle_deg(SERVO_CENTER_ANGLE);
-
-                    post_turn_ticks = POST_TURN_TICKS;
+                    fan_thrust_set(0);
                     state = STATE_FORWARD;
                 }
+
                 break;
             }
         }
 
-        // ---- GLOBAL DEBUG ----
-        UART_print("STATE=");
-        switch (state) {
-            case STATE_FORWARD:    UART_print("FWD");  break;
-            case STATE_TURN_LEFT:  UART_print("LEFT"); break;
-            case STATE_TURN_RIGHT: UART_print("RIGHT");break;
-        }
-        UART_print(" | yaw_raw=");
-        UART_printFloat(imu_yaw_deg);
-        UART_print(" | yaw_norm=");
-        UART_printFloat(yaw);
-        UART_print(" | front_ir_mean_cm=");
-        UART_printFloat(front_cm);
-        UART_print(" | PT=");
-        UART_printFloat((float)post_turn_ticks);
-        UART_print(" | TT=");
-        UART_printFloat((float)turn_ticks);
-        UART_print(" | LC=");
-        UART_printFloat((float)loop_count);
-        UART_print("\r\n");
-
-        _delay_ms(50);   // IMU_DT must be 0.05f in imu.c
+        _delay_ms(50);
     }
 
     return 0;
